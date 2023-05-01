@@ -1,0 +1,192 @@
+The aim of this quick documentation is to explain how to deploy and configure HashiCorp Vault and Ansible Tower to make ssh-ca 
+happen to secure your environment.
+
+- First Step : Installing Vault 
+
+To do that, you can use a shell script that I build to deploy a 1 Node Vault Server.
+  https://github.com/nehrman/hashicorp-solutions-scripts/blob/master/vault_single_server.sh
+
+- Second Step : Configure Vault for ssh-ca
+
+  For the sake of simplicity, we will only configure ssh-ca for client side. Host side could be also configured for adding more security
+  but we will see that in another demo.
+  
+  On Vault side : 
+  ---------------
+  
+    - Enable the ssh secret engine to a path that you can easily remember
+      vault secrets enable -path=ssh-ca-client-signer/ ssh
+      
+    - Configure CA on Vault. Here, you have two possibilities.
+      
+      You don't have an internal CA, so Vault will create one for you :
+        vault write ssh-ca-client-signer/config/ca generate_signing_key=true
+      
+      You already have a key pair, so you ask Vault to use it for the configuration :
+        vault write ssh-ca-client-signer/config/ca \
+          private_key="..." \
+          public_key= "..."
+    
+    - Create an ansible role in Vault for signing client keys from Ansible Tower :
+        vault write ssh-ca-client-signer/roles/ansible-<<"EOH"
+           {
+              "allow_user_certificates": true,
+              "allowed_users": "ansible",
+              "default_extensions": [
+                {
+                  "permit-pty": ""
+                }
+              ],
+              "key_type": "ca",
+              "default_user": "ansible",
+              "ttl": "30m0s" <= You can put whatever value you want here to control TTL of the signed key.
+           }
+           EOH
+       
+       If you want undertand more deeply all the values that Vault can offer, go to our API documentation : https://www.vaultproject.io/api/secret/ssh/index.html
+       
+    Now, you have a basically configured ssh-ca secret engine and you can start using it to authenticate your users.
+    
+  On every hosts :
+  ----------------
+  
+    - Now, you have to add the public key on every host you want to connect thru ssh-ca.
+      To achieve this goal, we can do it via :
+        - Packer Image creation where you automatically configure sshd and the public key
+        - Configuration Management tools
+        
+    - 2 actions must be done :
+    
+        - Retrieve the public key and store it on the host :
+          curl -o /etc/ssh/trusted-user-ca-keys.pem https://vaultserver.domain.com:8200/v1/ssh-ca-client-signer/public_key
+        
+        - Modify sshd_config for adding that key in the configuration and restart sshd service :
+          sudo sed -i -e '$aTrustedUserCAKeys trusted-user-ca-keys.pem' /etc/ssh/sshd_config && sudo systemctl restart sshd
+  
+  On Ansible Tower side :
+  -----------------------
+    
+  Because we use Ansible Tower, we're gonna use a role that you can find here : https://github.com/nehrman/hc_vault_machine_credential
+  That role is a fork from the one created by Automaticdavid (https://github.com/automaticdavid) during a POC that we had together with Vault and Ansible Tower.
+    
+  Of course, we imagine that you already have an Ansible Tower Up and Running in your environment. If not, you can go there : https://docs.ansible.com/ansible-tower/3.4.3/html/installandreference/index.html
+  
+  Now, let me explain what we have in the hc_vault_machine_credential role : 
+  
+  - First, we have to create a temporary directory on the host executing Ansible Tower to store the key that will be generated at the second step.
+  
+    ---
+    - name: Create temporary directory
+      tempfile:
+        state: directory
+        suffix: app
+      register: r_tempfile
+      delegate_to: localhost
+      become: no
+      run_once: true
+
+  - Now, we generate a SSH key that will be used for the signing process
+  
+    - name: Generate public key
+      command:
+        ssh-keygen -t rsa -f {{ r_tempfile.path | quote }}/id_rsa  -C "" -N ""
+      delegate_to: localhost
+      become: no
+      run_once: true
+
+    - name: Read public key 
+      set_fact: 
+        temp_public_key: "{{ lookup('file', r_tempfile.path + '/id_rsa.pub') }} "
+      delegate_to: localhost
+      run_once: true
+
+- For signing the key, we have to use the uri module of Ansible. That will allow us to send an API request, well formatted, to vault to sign the public_key.
+
+    - name: Sign public key
+      uri:
+        url: "{{ hc_vault_server }}/v1/ssh-signer/sign/ansible-role"
+        validate_certs: no
+        method: POST
+        headers:
+          X-Vault-Token: "{{ hc_vault_token }}"
+        body: "{{ lookup('template', 'templates/hc_vault_pubkey.j2') }}"
+        body_format: json
+        return_content: yes
+      register: r_sign
+      become: no
+      delegate_to: localhost
+      run_once: true
+
+    - debug:
+        var: r_sign.json
+
+- Here, we store the signed key in the temporary directory that we created at the first step.
+
+    - name: Store key temporarily
+      copy:  
+        content: "{{ r_sign.json.data.signed_key }}" 
+        dest: "{{ r_tempfile.path }}/signed"
+      delegate_to: localhost
+      become: no
+      run_once: true
+
+- Finally, we use set_fact to reconfigure the ansible connection values to use the correct private_key and signed_key.
+
+    # Reconfigure ansible connection values 
+
+    - set_fact:
+        ansible_ssh_private_key_file: "{{ r_tempfile.path }}/id_rsa"
+
+    - set_fact:
+        ansible_ssh_extra_args: "-i {{ r_tempfile.path }}/signed"
+
+    - set_fact:
+        ansible_user: ansible
+
+If you want to use this role, you just have to add this in your playbook :
+
+
+    - name: Get credentials from Vault
+      include_role: 
+        name: hc_vault_machine_credential
+        
+And, of course, create a requirements.yml file inside a role directory like this :
+
+  - demo_ansible
+      site.ympl
+      roles
+        requirements.yml
+  
+  requirements.yml : 
+    
+    ---
+    - src: https://github.com/automaticdavid/hc_vault_machine_credential.git
+      version: master
+      name: hc_vault_machine_credential
+
+Finally, to make everything works correctly, you have to create a custom credential where to register vault address and token.
+
+To do that : 
+
+  - Go to "CredentialT Types" from the Ansible Tower GUI. 
+  - Click on the "+" sign to add a new credential 
+    - Give it a name and a description 
+    - in "Input Configuration", add something like this :
+    
+          fields:
+            - type: string
+              id: vault_server
+              label: URL to Vault Server
+            - secret: true
+              type: string
+              id: vault_token
+               label: Vault Token
+            required:
+              - vault_server
+              - vault_token
+   
+    - In "Injector Configuration", add something like this :
+    
+          axtra_vars:
+            hc_vault_server: '{{ vault_server }}'
+            hc_vault_token: '{{ vault_token }}'
